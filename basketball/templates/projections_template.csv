@@ -1,0 +1,8 @@
+id,name,team,position,salary,fpts,ownership
+101,Player A,TEAM,PG,12.5,38.2,24.0
+102,Player B,TEAM,SG,10.8,34.6,18.0
+103,Player C,TEAM,SF,9.3,32.1,12.5
+104,Player D,TEAM,PF,11.0,36.7,16.0
+105,Player E,TEAM,C,13.2,40.4,22.0
+106,Player F,TEAM,PG,7.8,27.9,8.0
+107,Player G,TEAM,SF,6.4,24.2,5.0

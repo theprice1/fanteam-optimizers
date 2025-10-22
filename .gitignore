@@ -1,0 +1,44 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and artifacts
+*.log
+.pytest_cache/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Data and outputs (keep repo light)
+data/
+**/data/
+output/
+*.csv
+!basketball/templates/projections_template.csv
+!nfl/multi-game/data/nfl_sample.csv
+!football/multi-game/data/football_sample.csv
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# OS
+.DS_Store
+
+# Data/outputs (keep repo light; push only tiny samples)
+data/
+**/data/
+output/
+*.csv
+!basketball/templates/projections_template.csv
+!nfl/multi-game/data/nfl_sample.csv
+!football/multi-game/data/football_sample.csv

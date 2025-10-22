@@ -1,0 +1,7 @@
+streamlit==1.39.0
+pulp==2.7.0
+pandas>=2.3.0
+numpy>=2.3.0
+rapidfuzz==3.14.1
+requests>=2.27.0
+beautifulsoup4>=4.12.0

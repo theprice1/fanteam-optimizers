@@ -7,7 +7,7 @@ import pulp as pl
 import streamlit as st
 
 
-VALID_POSITIONS = ["QB", "RB", "WR", "TE", "DEF"]
+VALID_POSITIONS = ["QB", "RB", "WR", "TE", "DST"]
 
 
 def compute_offense_fpts(row: pd.Series) -> float:
@@ -83,7 +83,57 @@ def normalize_schema_or_compute(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
     def has(col: str) -> bool:
         return col in cols_lower
 
-    # Already in optimizer schema
+    # Case 1: New schema format (Name, Pos, Team, Salary, Proj, ...)
+    if has("name") and has("pos") and has("team") and has("salary") and has("proj"):
+        name_col = cols_lower["name"]
+        pos_col = cols_lower["pos"]
+        team_col = cols_lower["team"]
+        salary_col = cols_lower["salary"]
+        proj_col = cols_lower["proj"]
+        
+        # Build base dataframe
+        out = pd.DataFrame({
+            "name": df[name_col].astype(str).str.strip(),
+            "team": df[team_col].astype(str).str.strip(),
+            "position": df[pos_col].astype(str).str.strip().str.upper(),
+            "salary": pd.to_numeric(df[salary_col], errors="coerce"),
+            "fpts": pd.to_numeric(df[proj_col], errors="coerce"),
+        })
+        
+        # Handle ID - prefer Ids column, fallback to index
+        if has("ids"):
+            ids_col = cols_lower["ids"]
+            out["id"] = df[ids_col]
+        else:
+            out["id"] = range(len(out))
+        
+        # Handle ownership - not present in this schema, default to 0
+        out["ownership"] = 0.0
+        
+        # Preserve optional columns for weighted scoring
+        optional_cols = {
+            "value": "value",
+            "lineup": "lineup_status",
+            "form": "form",
+            "lastpoints": "lastpoints",
+            "totalpoints": "totalpoints",
+        }
+        
+        for lower_name, target_name in optional_cols.items():
+            if has(lower_name):
+                orig_col = cols_lower[lower_name]
+                out[target_name] = pd.to_numeric(df[orig_col], errors="coerce")
+        
+        # Reorder columns
+        base_cols = ["id", "name", "team", "position", "salary", "fpts", "ownership"]
+        extra_cols = [c for c in out.columns if c not in base_cols]
+        out = out[base_cols + extra_cols]
+        
+        # Filter positions
+        out = out[out["position"].isin(VALID_POSITIONS)].dropna(subset=["salary", "fpts"]).reset_index(drop=True)
+        return out, "Detected new projections format (Name/Pos/Team/Salary/Proj)."
+
+    # Case 2: Already in optimizer schema
     if all(has(c) for c in ["id", "name", "team", "position", "salary"]) and (
         has("fpts") or has("proj")
     ):
@@ -99,7 +149,7 @@ def normalize_schema_or_compute(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
         out["position"] = out["position"].str.upper()
         return out, "Detected optimizer schema with fpts/proj."
 
-    # Raw stats schema: we compute fpts per the provided scoring
+    # Case 3: Raw stats schema: we compute fpts per the provided scoring
     required_like = ["id", "name", "team", "position", "salary"]
     if all(any(c.lower() == r.lower() for c in original_cols) for r in required_like):
         out = df.copy()
@@ -112,7 +162,7 @@ def normalize_schema_or_compute(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
         # Compute fpts per row based on position
         def compute_row(row: pd.Series) -> float:
             pos = str(row.get("position", "")).upper()
-            if pos == "DEF":
+            if pos in ["DEF", "DST"]:
                 return compute_defense_fpts(row)
             return compute_offense_fpts(row)
 
@@ -135,6 +185,8 @@ def build_lineup_ilp(
     min_per_pos: Dict[str, int],
     max_per_pos: Dict[str, int],
     max_same_team: int,
+    *,
+    score_col: str = "fpts",
     ownership_weight: float = 0.0,
     eps_budget_tiebreak: float = 1e-6,
     banned_player_ids: set | None = None,
@@ -170,15 +222,15 @@ def build_lineup_ilp(
         team_idx = [int(i) for i in team_group.index]
         prob += pl.lpSum([x[i] for i in team_idx]) <= max_same_team
 
-    total_fpts = pl.lpSum([players.iloc[i]["fpts"] * x[i] for i in idxs])
+    total_score = pl.lpSum([players.iloc[i][score_col] * x[i] for i in idxs])
     total_salary = pl.lpSum([players.iloc[i]["salary"] * x[i] for i in idxs])
     leftover = budget - total_salary
 
     if "ownership" in players.columns and ownership_weight != 0.0:
         total_own = pl.lpSum([players.iloc[i]["ownership"] * x[i] for i in idxs])
-        objective = total_fpts - ownership_weight * total_own + eps_budget_tiebreak * leftover
+        objective = total_score - ownership_weight * total_own + eps_budget_tiebreak * leftover
     else:
-        objective = total_fpts + eps_budget_tiebreak * leftover
+        objective = total_score + eps_budget_tiebreak * leftover
 
     prob += objective
 
@@ -204,6 +256,8 @@ def generate_lineups(
     min_per_pos: Dict[str, int],
     max_per_pos: Dict[str, int],
     max_same_team: int,
+    *,
+    score_col: str = "fpts",
 ) -> List[Dict[str, Any]]:
     df = base_df.copy().reset_index(drop=True)
     if "ownership" not in df.columns:
@@ -223,6 +277,7 @@ def generate_lineups(
             min_per_pos,
             max_per_pos,
             max_same_team,
+            score_col=score_col,
             ownership_weight=ownership_weight,
             eps_budget_tiebreak=1e-6,
             banned_player_ids=banned,
@@ -256,6 +311,7 @@ def generate_lineups(
                     min_per_pos,
                     max_per_pos,
                     max_same_team,
+                    score_col=score_col,
                     ownership_weight=ownership_weight,
                     eps_budget_tiebreak=1e-6,
                     banned_player_ids=banned,
@@ -284,17 +340,17 @@ def generate_lineups(
 
 def layout_optimizer_tab():
     st.header("NFL Multi-Game Optimizer")
-    st.caption("Upload projections or raw stats. Supports optimizer schema or raw stats with fpts computed per rules.")
+    st.caption("Upload projections or raw stats. Supports new format (Name/Pos/Team/Salary/Proj), optimizer schema, or raw stats.")
 
     with st.sidebar:
         st.subheader("Settings")
         budget = st.number_input("Budget (M)", value=120.0, min_value=1.0, step=1.0)
         lineup_size = st.number_input("Squad size", value=9, min_value=8, max_value=11, step=1)
 
-        min_per_pos = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "DEF": 1}
-        max_per_pos = {"QB": 1, "RB": 3, "WR": 4, "TE": 2, "DEF": 1}
+        min_per_pos = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "DEF": 1, "DST": 1}
+        max_per_pos = {"QB": 1, "RB": 3, "WR": 4, "TE": 2, "DEF": 1, "DST": 1}
         st.write("Position limits:")
-        st.write("QB 1/1, RB 2/3, WR 3/4, TE 1/2, DEF 1/1")
+        st.write("QB 1/1, RB 2/3, WR 3/4, TE 1/2, DEF/DST 1/1")
 
         max_same_team = st.number_input("Max players per team", value=3, min_value=1, max_value=6, step=1)
 
@@ -303,19 +359,24 @@ def layout_optimizer_tab():
         max_exposure_pct = st.slider("Max exposure per player (%)", min_value=10, max_value=100, value=60, step=5) / 100.0
         ownership_weight = st.slider("Ownership weight (fpts - weight*ownership)", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
 
+        st.markdown("**Scoring Mode**")
+        score_mode = st.selectbox("Score to optimize", ["Proj (fpts)", "Form", "LastPoints", "TotalPoints", "Weighted Score"], index=0)
+        
+        st.markdown("Feature weights (used if Weighted Score)")
+        w_value = st.slider("Weight: Value", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
+        w_form = st.slider("Weight: Form", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
+        w_lastpoints = st.slider("Weight: LastPoints", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
+        w_totalpoints = st.slider("Weight: TotalPoints", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
+
         st.caption("Tie-breaker: if fpts tie, prefers higher remaining budget.")
 
     sample_btn = st.button("Download CSV template")
     if sample_btn:
-        # Template with raw stats columns and/or fpts
-        sample_csv = (
-            "id,name,team,position,salary,passing_yards,rushing_yards,receiving_yards,passing_td,rushing_td,receiving_td,return_td,interception,reception,fumble_lost,two_point,"
-            "sack,def_interception,fumble_recovery,safety,blocked_kick,def_td,points_allowed\n"
-            "201,Player QB,TEAM,QB,14.0,280,10,0,2,0,0,0,1,0,0,1,0,0,0,0,0,0,0\n"
-            "202,Player RB,TEAM,RB,13.0,0,75,15,0,1,0,0,0,2,0,0,0,0,0,0,0,0,0\n"
-            "203,Player WR,TEAM,WR,12.0,0,5,80,0,0,1,0,0,5,0,0,0,0,0,0,0,0,0\n"
-            "204,Defense DEF,DEF,DEF,9.0,0,0,0,0,0,0,0,0,0,0,0,3,1,1,0,0,1,17\n"
-        )
+        sample_csv = """Name,Pos,Team,Salary,Proj,Value,lineup,form,lastPoints,totalPoints,Ids
+Lamar Jackson,QB,BAL,19.8,24.3,1.23,possible,23.3,10.7,93.4,4352569
+Derrick Henry,RB,BAL,18.2,20.5,1.13,possible,22.1,15.3,87.2,4353210
+CeeDee Lamb,WR,DAL,17.5,19.8,1.13,possible,21.4,12.8,92.1,4354123
+"""
         sample = pd.read_csv(io.StringIO(sample_csv))
         st.download_button(
             label="nfl_template.csv",
@@ -342,8 +403,53 @@ def layout_optimizer_tab():
 
     if st.button("Build lineups"):
         try:
+            # Prepare score column
+            working = df.copy()
+            score_col = "fpts"
+            
+            if score_mode == "Form":
+                if "form" in working.columns:
+                    score_col = "form"
+                else:
+                    st.warning("Form column not found, using fpts instead")
+            elif score_mode == "LastPoints":
+                if "lastpoints" in working.columns:
+                    score_col = "lastpoints"
+                else:
+                    st.warning("LastPoints column not found, using fpts instead")
+            elif score_mode == "TotalPoints":
+                if "totalpoints" in working.columns:
+                    score_col = "totalpoints"
+                else:
+                    st.warning("TotalPoints column not found, using fpts instead")
+            elif score_mode.startswith("Weighted"):
+                # Build weighted score from optional columns
+                feats = []
+                weights = []
+                
+                for col_name, w in [("value", w_value), ("form", w_form), ("lastpoints", w_lastpoints), ("totalpoints", w_totalpoints)]:
+                    if w <= 0:
+                        continue
+                    if col_name not in working.columns:
+                        continue
+                    series = pd.to_numeric(working[col_name], errors="coerce")
+                    std = series.std(skipna=True)
+                    if std and std > 0:
+                        feat = (series - series.mean(skipna=True)) / std
+                    else:
+                        feat = series.fillna(series.mean(skipna=True))
+                    feats.append(feat)
+                    weights.append(w)
+
+                if feats:
+                    wsum = float(sum(weights))
+                    mat = pd.concat(feats, axis=1).fillna(0.0)
+                    wnorm = np.array([w / wsum for w in weights])
+                    working["weighted_score"] = (mat @ wnorm) + working["fpts"]
+                    score_col = "weighted_score"
+
             results = generate_lineups(
-                df,
+                working,
                 num_lineups=int(num_lineups),
                 budget=float(budget),
                 lineup_size=int(lineup_size),
@@ -353,6 +459,7 @@ def layout_optimizer_tab():
                 min_per_pos=min_per_pos,
                 max_per_pos=max_per_pos,
                 max_same_team=int(max_same_team),
+                score_col=score_col,
             )
         except Exception as e:
             st.error(f"Failed to generate lineups: {e}")
@@ -386,12 +493,10 @@ def main():
     st.markdown("---")
     st.markdown(
         "- Team cap: up to 3 from the same team.\n"
-        "- Position limits: QB 1/1, RB 2/3, WR 3/4, TE 1/2, DEF 1/1.\n"
+        "- Position limits: QB 1/1, RB 2/3, WR 3/4, TE 1/2, DEF/DST 1/1.\n"
         "- Budget tie-breaker: if fpts tie, prefers higher remaining budget."
     )
 
 
 if __name__ == "__main__":
     main()
-
-

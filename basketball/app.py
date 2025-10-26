@@ -36,7 +36,65 @@ def normalize_schema(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
         out = out[out["position"].isin(VALID_POSITIONS)].dropna(subset=["salary", "fpts"]).reset_index(drop=True)
         return out, "Detected optimizer schema."
 
-    # Case 2: Your projections CSV format
+    # Case 2: New schema format (Name, Pos, Team, Salary, Proj, ...)
+    # Expected headers: Name, Pos, Team, Salary, Proj, Value, FT-Pref, Own%, Form, Floor, Ceil, Std Dev, Boom, Status, Ids
+    if has("name") and has("pos") and has("team") and has("salary") and has("proj"):
+        name_col = cols_lower["name"]
+        pos_col = cols_lower["pos"]
+        team_col = cols_lower["team"]
+        salary_col = cols_lower["salary"]
+        proj_col = cols_lower["proj"]
+        
+        # Build base dataframe
+        out = pd.DataFrame({
+            "name": df[name_col].astype(str).str.strip(),
+            "team": df[team_col].astype(str).str.strip(),
+            "position": df[pos_col].astype(str).str.strip(),
+            "salary": pd.to_numeric(df[salary_col], errors="coerce"),
+            "fpts": pd.to_numeric(df[proj_col], errors="coerce"),
+        })
+        
+        # Handle ID - prefer Ids column, fallback to index
+        if has("ids"):
+            ids_col = cols_lower["ids"]
+            out["id"] = df[ids_col]
+        else:
+            out["id"] = range(len(out))
+        
+        # Handle ownership - prefer Own% column
+        if has("own%"):
+            own_col = cols_lower["own%"]
+            out["ownership"] = pd.to_numeric(df[own_col].astype(str).str.rstrip('%'), errors="coerce").fillna(0.0)
+        else:
+            out["ownership"] = 0.0
+        
+        # Preserve optional columns for weighted scoring
+        optional_cols = {
+            "value": "value",
+            "ft-pref": "ft_pref",
+            "form": "form",
+            "floor": "floor",
+            "ceil": "ceiling",  # Map to "ceiling" for consistency
+            "std dev": "std_dev",
+            "boom": "boom",
+            "status": "status"
+        }
+        
+        for lower_name, target_name in optional_cols.items():
+            if has(lower_name):
+                orig_col = cols_lower[lower_name]
+                out[target_name] = pd.to_numeric(df[orig_col], errors="coerce")
+        
+        # Reorder columns
+        base_cols = ["id", "name", "team", "position", "salary", "fpts", "ownership"]
+        extra_cols = [c for c in out.columns if c not in base_cols]
+        out = out[base_cols + extra_cols]
+        
+        # Filter positions
+        out = out[out["position"].isin(VALID_POSITIONS)].dropna(subset=["salary", "fpts"]).reset_index(drop=True)
+        return out, "Detected new projections format (Name/Pos/Team/Salary/Proj)."
+
+    # Case 3: Original projections CSV format
     # Expected headers like: Id, Name, Pos, TEAM, ... Proj_adj, Salary, FP ...
     # Prefer Proj_adj for fpts; fallback to FP
     required_like = ["Id", "Name", "Pos", "TEAM", "Salary"]
@@ -271,7 +329,7 @@ def generate_lineups(
 
 def layout_optimizer_tab():
     st.header("Optimizer")
-    st.caption("Upload a projections CSV. Accepted: optimizer schema or your projections CSV (Id/Name/Pos/TEAM/Salary + Proj_adj/FP).")
+    st.caption("Upload a projections CSV. Accepted formats: optimizer schema, new format (Name/Pos/Team/Salary/Proj), or original (Id/Name/Pos/TEAM/Salary + Proj_adj/FP).")
 
     # Controls
     with st.sidebar:
@@ -290,17 +348,14 @@ def layout_optimizer_tab():
         ownership_weight = st.slider("Ownership weight (fpts - weight*ownership)", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
 
         st.markdown("**Tournament settings**")
-        score_mode = st.selectbox("Score to optimize", ["Mean (fpts)", "Ceiling", "Weighted Tournament Score"], index=0)
-        ceiling_col = st.text_input("Ceiling column name (if present)", value="ceiling")
+        score_mode = st.selectbox("Score to optimize", ["Mean (fpts)", "Ceiling", "Floor", "Boom", "Weighted Tournament Score"], index=0)
         ceiling_multiplier = st.number_input("Ceiling multiplier (if no ceiling column)", value=1.15, min_value=1.0, max_value=2.0, step=0.01)
 
         st.markdown("Feature weights (used if Weighted Tournament Score)")
         w_value = st.slider("Weight: Value", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
-        w_dvp = st.slider("Weight: DvP", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
-        w_teamx = st.slider("Weight: TeamXPts", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
-        w_pace = st.slider("Weight: Team Pace", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
-        w_fppm = st.slider("Weight: FPPM", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
-        w_minproj = st.slider("Weight: MinProj", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
+        w_form = st.slider("Weight: Form", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
+        w_boom = st.slider("Weight: Boom", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
+        w_floor = st.slider("Weight: Floor", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
 
         st.markdown("Auto-stacking")
         auto_stack_bonus = st.number_input("Bonus per same-team pair (additive)", value=0.0, min_value=0.0, max_value=5.0, step=0.05)
@@ -317,14 +372,10 @@ def layout_optimizer_tab():
     # Template download
     sample_btn = st.button("Download CSV template")
     if sample_btn:
-        sample_csv = """id,name,team,position,salary,fpts,ownership
-101,Player A,TEAM,PG,12.5,38.2,24.0
-102,Player B,TEAM,SG,10.8,34.6,18.0
-103,Player C,TEAM,SF,9.3,32.1,12.5
-104,Player D,TEAM,PF,11.0,36.7,16.0
-105,Player E,TEAM,C,13.2,40.4,22.0
-106,Player F,TEAM,PG,7.8,27.9,8.0
-107,Player G,TEAM,SF,6.4,24.2,5.0
+        sample_csv = """Name,Pos,Team,Salary,Proj,Value,FT-Pref,Own%,Form,Floor,Ceil,Std Dev,Boom,Status,Ids
+Nikola Jokic,C,DEN,19.1,61.4,3.22,6.6,40.70%,59.3,43.1,79.2,14.2,13.40%,expected,4430998
+Luka Doncic,PG,DAL,18.5,58.2,3.15,7.2,35.50%,56.8,41.5,75.8,13.8,12.80%,expected,4431002
+Anthony Davis,PF,LAL,17.2,54.6,3.17,5.8,28.30%,52.4,38.2,71.4,13.1,11.90%,expected,4431005
 """
         sample = pd.read_csv(io.StringIO(sample_csv))
         st.download_button(
@@ -355,28 +406,34 @@ def layout_optimizer_tab():
             # Prepare score column
             working = df.copy()
             score_col = "fpts"
-            if score_mode.startswith("Ceiling"):
-                if ceiling_col in working.columns:
-                    working[ceiling_col] = pd.to_numeric(working[ceiling_col], errors="coerce")
-                    score_col = ceiling_col
+            
+            if score_mode == "Ceiling":
+                if "ceiling" in working.columns:
+                    score_col = "ceiling"
                 else:
                     working["ceil_calc"] = working["fpts"] * float(ceiling_multiplier)
                     score_col = "ceil_calc"
+            elif score_mode == "Floor":
+                if "floor" in working.columns:
+                    score_col = "floor"
+                else:
+                    st.warning("Floor column not found, using fpts instead")
+            elif score_mode == "Boom":
+                if "boom" in working.columns:
+                    score_col = "boom"
+                else:
+                    st.warning("Boom column not found, using fpts instead")
             elif score_mode.startswith("Weighted"):
                 # Build weighted score from optional columns
-                lower_cols = {c.lower(): c for c in working.columns}
-                def find_col(name: str) -> str | None:
-                    return lower_cols.get(name.lower())
-
                 feats = []
                 weights = []
-                for name, w in [("value", w_value), ("dvp", w_dvp), ("teamxpts", w_teamx), ("team pace", w_pace), ("fppm", w_fppm), ("minproj", w_minproj)]:
+                
+                for col_name, w in [("value", w_value), ("form", w_form), ("boom", w_boom), ("floor", w_floor)]:
                     if w <= 0:
                         continue
-                    col = find_col(name)
-                    if not col:
+                    if col_name not in working.columns:
                         continue
-                    series = pd.to_numeric(working[col], errors="coerce")
+                    series = pd.to_numeric(working[col_name], errors="coerce")
                     std = series.std(skipna=True)
                     if std and std > 0:
                         feat = (series - series.mean(skipna=True)) / std
@@ -443,7 +500,7 @@ def layout_optimizer_tab():
 
 def layout_prepare_tab():
     st.header("Prepare CSV")
-    st.caption("Convert your projections CSV (Id, Name, Pos, TEAM, Salary, Proj_adj/FP) into optimizer schema.")
+    st.caption("Convert your projections CSV into optimizer schema.")
 
     uploaded = st.file_uploader("Choose your projections CSV", type=["csv"], key="prepare_uploader")
     if uploaded is None:
@@ -480,7 +537,7 @@ def main():
     st.markdown(
         "- Position limits: 1–3 for each of PG, SG, SF, PF, C; total players = 7.\n"
         "- Budget tie-breaker: if fpts tie, the solver prefers higher remaining budget.\n"
-        "- Ownership (optional): add a column 'ownership' (0–100 scale) to slightly fade chalk via weight.\n"
+        "- Ownership (optional): add a column 'ownership' or 'Own%' (0–100 scale) to fade chalk via weight.\n"
         "- Multi-lineups: sequential solve with min-uniques and exposure caps."
     )
 

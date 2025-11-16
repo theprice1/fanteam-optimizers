@@ -190,9 +190,13 @@ def build_lineup_ilp(
     ownership_weight: float = 0.0,
     eps_budget_tiebreak: float = 1e-6,
     banned_player_ids: set | None = None,
+    enforce_stacking_rules: bool = False,
+    opponent_map: Dict[str, str] | None = None,
 ) -> Tuple[List[int], float, float, float]:
     if banned_player_ids is None:
         banned_player_ids = set()
+    if opponent_map is None:
+        opponent_map = {}
 
     idxs = list(range(len(players)))
     prob = pl.LpProblem("nfl_multi_optimizer", pl.LpMaximize)
@@ -221,6 +225,68 @@ def build_lineup_ilp(
     for team, team_group in players.groupby("team"):
         team_idx = [int(i) for i in team_group.index]
         prob += pl.lpSum([x[i] for i in team_idx]) <= max_same_team
+
+    # STACKING RULES
+    if enforce_stacking_rules:
+        # Rule 1: No defense against any player in lineup
+        # If DST from team A is selected, no offensive players from opponent of A
+        dst_indices = [i for i in idxs if str(players.iloc[i]["position"]).upper() in ["DST", "DEF"]]
+        for dst_idx in dst_indices:
+            dst_team = str(players.iloc[dst_idx]["team"]).upper()
+            opponent_team = opponent_map.get(dst_team, "").upper()
+            if opponent_team:
+                # Find all offensive players from opponent team
+                opp_offense = [i for i in idxs 
+                             if str(players.iloc[i]["team"]).upper() == opponent_team 
+                             and str(players.iloc[i]["position"]).upper() not in ["DST", "DEF"]]
+                if opp_offense:
+                    # If DST selected, sum of opponent offense must be 0
+                    prob += pl.lpSum([x[i] for i in opp_offense]) <= len(opp_offense) * (1 - x[dst_idx])
+
+        # Rule 2: No more than 2 pass catchers (WR/TE) with same QB
+        qb_indices = [i for i in idxs if str(players.iloc[i]["position"]).upper() == "QB"]
+        for qb_idx in qb_indices:
+            qb_team = str(players.iloc[qb_idx]["team"]).upper()
+            # Find WR/TE from same team
+            pass_catchers = [i for i in idxs 
+                           if str(players.iloc[i]["team"]).upper() == qb_team
+                           and str(players.iloc[i]["position"]).upper() in ["WR", "TE"]]
+            if pass_catchers:
+                # If QB selected, max 2 pass catchers from same team
+                # We need: sum(pass_catchers) <= 2 when x[qb_idx] = 1
+                # And: sum(pass_catchers) can be anything when x[qb_idx] = 0
+                # This translates to: sum(pass_catchers) <= 2 + M*(1 - x[qb_idx])
+                # where M is large enough (lineup_size works)
+                prob += pl.lpSum([x[i] for i in pass_catchers]) <= 2 + lineup_size * (1 - x[qb_idx])
+
+        # Rule 3: Only 1 RB per team
+        for team, team_group in players.groupby("team"):
+            rb_idx = [int(i) for i in team_group.index 
+                     if str(players.iloc[i]["position"]).upper() == "RB"]
+            if rb_idx:
+                prob += pl.lpSum([x[i] for i in rb_idx]) <= 1
+
+        # Rule 4: Only 1 pass catcher without the QB (orphan pass catcher limit)
+        # For each team: if QB not selected, at most 1 WR/TE from that team
+        for team, team_group in players.groupby("team"):
+            team_qbs = [int(i) for i in team_group.index 
+                       if str(players.iloc[i]["position"]).upper() == "QB"]
+            team_catchers = [int(i) for i in team_group.index 
+                           if str(players.iloc[i]["position"]).upper() in ["WR", "TE"]]
+            
+            if team_catchers:
+                if team_qbs:
+                    # If any QB from this team is selected, no limit on catchers (handled by rule 2)
+                    # If no QB selected, at most 1 catcher
+                    qb_selected = pl.lpSum([x[i] for i in team_qbs])
+                    catchers_selected = pl.lpSum([x[i] for i in team_catchers])
+                    # catchers_selected <= 1 + M * qb_selected
+                    # When qb_selected = 0: catchers <= 1
+                    # When qb_selected >= 1: catchers <= 1 + M (effectively no limit, rule 2 applies)
+                    prob += catchers_selected <= 1 + lineup_size * qb_selected
+                else:
+                    # No QB available, limit catchers to 1
+                    prob += pl.lpSum([x[i] for i in team_catchers]) <= 1
 
     total_score = pl.lpSum([players.iloc[i][score_col] * x[i] for i in idxs])
     total_salary = pl.lpSum([players.iloc[i]["salary"] * x[i] for i in idxs])
@@ -258,6 +324,9 @@ def generate_lineups(
     max_same_team: int,
     *,
     score_col: str = "fpts",
+    max_exposure_by_pos: Dict[str, float] | None = None,
+    enforce_stacking_rules: bool = False,
+    opponent_map: Dict[str, str] | None = None,
 ) -> List[Dict[str, Any]]:
     df = base_df.copy().reset_index(drop=True)
     if "ownership" not in df.columns:
@@ -265,10 +334,23 @@ def generate_lineups(
 
     exposure_counts: Dict[Any, int] = {}
     max_count = max(1, int(np.floor(max_exposure_pct * num_lineups)))
+    
+    # Per-position exposure limits
+    if max_exposure_by_pos is None:
+        max_exposure_by_pos = {}
+    pos_exposure_counts: Dict[Tuple[Any, str], int] = {}
+    
     results: List[Dict[str, Any]] = []
 
     for k in range(num_lineups):
         banned = {pid for pid, cnt in exposure_counts.items() if cnt >= max_count}
+        
+        # Add position-specific exposure bans
+        for (pid, pos), cnt in pos_exposure_counts.items():
+            if pos in max_exposure_by_pos:
+                pos_max = max(1, int(np.floor(max_exposure_by_pos[pos] * num_lineups)))
+                if cnt >= pos_max:
+                    banned.add(pid)
 
         sel, f, s, o = build_lineup_ilp(
             df,
@@ -281,6 +363,8 @@ def generate_lineups(
             ownership_weight=ownership_weight,
             eps_budget_tiebreak=1e-6,
             banned_player_ids=banned,
+            enforce_stacking_rules=enforce_stacking_rules,
+            opponent_map=opponent_map,
         )
         if not sel:
             break
@@ -315,6 +399,8 @@ def generate_lineups(
                     ownership_weight=ownership_weight,
                     eps_budget_tiebreak=1e-6,
                     banned_player_ids=banned,
+                    enforce_stacking_rules=enforce_stacking_rules,
+                    opponent_map=opponent_map,
                 )
                 if not sel:
                     break
@@ -332,8 +418,11 @@ def generate_lineups(
             "ownership": o,
         })
 
-        for pid in ids:
+        for i in sel:
+            pid = df.iloc[i]["id"]
+            pos = str(df.iloc[i]["position"]).upper()
             exposure_counts[pid] = exposure_counts.get(pid, 0) + 1
+            pos_exposure_counts[(pid, pos)] = pos_exposure_counts.get((pid, pos), 0) + 1
 
     return results
 
@@ -354,9 +443,31 @@ def layout_optimizer_tab():
 
         max_same_team = st.number_input("Max players per team", value=3, min_value=1, max_value=6, step=1)
 
+        st.markdown("---")
+        st.markdown("**Stacking Rules**")
+        enforce_stacking = st.checkbox("Enable stacking rules", value=False, help="Enforce correlation rules for better lineup construction")
+        if enforce_stacking:
+            st.info(
+                "Active rules:\n"
+                "• No defense vs offensive players\n"
+                "• Max 2 pass catchers with QB\n"
+                "• Max 1 RB per team\n"
+                "• Max 1 orphan pass catcher (without QB)"
+            )
+
+        st.markdown("---")
         num_lineups = st.number_input("Number of lineups", value=10, min_value=1, max_value=500, step=1)
         min_uniques = st.number_input("Minimum uniques between lineups", value=2, min_value=0, max_value=11, step=1)
         max_exposure_pct = st.slider("Max exposure per player (%)", min_value=10, max_value=100, value=60, step=5) / 100.0
+        
+        st.markdown("**Position-specific exposure limits**")
+        st.caption("Leave at 100% to use overall exposure limit only")
+        pos_exp_qb = st.slider("QB max exposure (%)", min_value=10, max_value=100, value=100, step=5) / 100.0
+        pos_exp_rb = st.slider("RB max exposure (%)", min_value=10, max_value=100, value=100, step=5) / 100.0
+        pos_exp_wr = st.slider("WR max exposure (%)", min_value=10, max_value=100, value=100, step=5) / 100.0
+        pos_exp_te = st.slider("TE max exposure (%)", min_value=10, max_value=100, value=100, step=5) / 100.0
+        pos_exp_dst = st.slider("DST max exposure (%)", min_value=10, max_value=100, value=100, step=5) / 100.0
+        
         ownership_weight = st.slider("Ownership weight (fpts - weight*ownership)", min_value=0.0, max_value=2.0, value=0.0, step=0.05)
 
         st.markdown("**Scoring Mode**")
@@ -384,8 +495,50 @@ CeeDee Lamb,WR,DAL,17.5,19.8,1.13,possible,21.4,12.8,92.1,4354123
             file_name="nfl_template.csv",
             mime="text/csv",
         )
+    
+    opp_sample_btn = st.button("Download opponent mapping template")
+    if opp_sample_btn:
+        opp_sample_csv = """Team,Opponent
+BAL,CIN
+CIN,BAL
+KC,LV
+LV,KC
+DAL,PHI
+PHI,DAL
+"""
+        opp_sample = pd.read_csv(io.StringIO(opp_sample_csv))
+        st.download_button(
+            label="opponent_template.csv",
+            data=opp_sample.to_csv(index=False).encode("utf-8"),
+            file_name="opponent_template.csv",
+            mime="text/csv",
+        )
 
     uploaded = st.file_uploader("Choose projections or stats CSV", type=["csv"])
+    
+    # Optional opponent mapping upload
+    opponent_file = None
+    opponent_map = {}
+    if enforce_stacking:
+        st.markdown("**Opponent Mapping (Optional)**")
+        st.caption("Upload a CSV with 'Team' and 'Opponent' columns to enable defense vs offense rule")
+        opponent_file = st.file_uploader("Choose opponent mapping CSV (optional)", type=["csv"], key="opponent_upload")
+        
+        if opponent_file:
+            try:
+                opp_df = pd.read_csv(opponent_file)
+                opp_df.columns = [c.strip().lower() for c in opp_df.columns]
+                if 'team' in opp_df.columns and 'opponent' in opp_df.columns:
+                    opponent_map = dict(zip(
+                        opp_df['team'].str.strip().str.upper(),
+                        opp_df['opponent'].str.strip().str.upper()
+                    ))
+                    st.success(f"Loaded opponent mapping for {len(opponent_map)} teams")
+                else:
+                    st.warning("Opponent CSV must have 'Team' and 'Opponent' columns")
+            except Exception as e:
+                st.error(f"Failed to parse opponent CSV: {e}")
+    
     if uploaded is None:
         st.info("Upload a CSV to continue.")
         return
@@ -406,6 +559,20 @@ CeeDee Lamb,WR,DAL,17.5,19.8,1.13,possible,21.4,12.8,92.1,4354123
             # Prepare score column
             working = df.copy()
             score_col = "fpts"
+            
+            # Build position exposure dict
+            max_exposure_by_pos = {}
+            if pos_exp_qb < 1.0:
+                max_exposure_by_pos["QB"] = pos_exp_qb
+            if pos_exp_rb < 1.0:
+                max_exposure_by_pos["RB"] = pos_exp_rb
+            if pos_exp_wr < 1.0:
+                max_exposure_by_pos["WR"] = pos_exp_wr
+            if pos_exp_te < 1.0:
+                max_exposure_by_pos["TE"] = pos_exp_te
+            if pos_exp_dst < 1.0:
+                max_exposure_by_pos["DST"] = pos_exp_dst
+                max_exposure_by_pos["DEF"] = pos_exp_dst  # Handle both DST/DEF
             
             if score_mode == "Form":
                 if "form" in working.columns:
@@ -460,6 +627,9 @@ CeeDee Lamb,WR,DAL,17.5,19.8,1.13,possible,21.4,12.8,92.1,4354123
                 max_per_pos=max_per_pos,
                 max_same_team=int(max_same_team),
                 score_col=score_col,
+                max_exposure_by_pos=max_exposure_by_pos,
+                enforce_stacking_rules=enforce_stacking,
+                opponent_map=opponent_map,
             )
         except Exception as e:
             st.error(f"Failed to generate lineups: {e}")
@@ -494,7 +664,12 @@ def main():
     st.markdown(
         "- Team cap: up to 3 from the same team.\n"
         "- Position limits: QB 1/1, RB 2/3, WR 3/4, TE 1/2, DEF/DST 1/1.\n"
-        "- Budget tie-breaker: if fpts tie, prefers higher remaining budget."
+        "- Budget tie-breaker: if fpts tie, prefers higher remaining budget.\n"
+        "- **Stacking rules** (when enabled):\n"
+        "  - No defense against offensive players from opponent\n"
+        "  - Max 2 pass catchers (WR/TE) stacked with same QB\n"
+        "  - Max 1 RB per team\n"
+        "  - Max 1 orphan pass catcher per team (without QB)\n"
     )
 
 

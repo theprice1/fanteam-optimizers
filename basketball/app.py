@@ -538,9 +538,4 @@ def main():
         "- Position limits: 1–3 for each of PG, SG, SF, PF, C; total players = 7.\n"
         "- Budget tie-breaker: if fpts tie, the solver prefers higher remaining budget.\n"
         "- Ownership (optional): add a column 'ownership' or 'Own%' (0–100 scale) to fade chalk via weight.\n"
-        "- Multi-lineups: sequential solve with min-uniques and exposure caps."
-    )
-
-
-if __name__ == "__main__":
-    main()
+        "- 
